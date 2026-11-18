@@ -1,0 +1,344 @@
+================================================================================
+STEP-BY-STEP GUIDE: BVM MODIFICATION, DRIVER COMPILATION, AND INSTALLATION
+FOR WINDOWS 11 ARM64 ON RASPBERRY PI 5 (V3D / VENUS / WDDM / MESA / VULKAN)
+Guide Date:         2026-11-18
+Project Directory:  win11-arm64-viogpu3d
+Patches & Configs:  patches/
+Build Scripts:      scripts/
+Verification Tests: tests/
+Output Package:     out/package-arm64/
+================================================================================
+
+This guide documents the exact, end-to-end verified procedure to:
+1. Modify Botspot's `bvm` and VM configuration (`bvm-config`) for VirtIO-GPU Venus
+   3D passthrough on Raspberry Pi 5,
+2. Apply the required source code modifications to `virtio-win-mesa` and
+   `yttrium-virtio-gpu`,
+3. Cross-compile the ARM64 WDDM Kernel-Mode Driver (`viogpu3d.sys`), the ARM64
+   and x86 User-Mode Drivers, Khronos `vulkan-1.dll`, and link ARM64X hybrid DLLs
+   for emulated x64 Windows applications (such as x64 Java / TLauncher / Minecraft),
+4. Package, catalog-hash, test-sign, and safely install or upgrade the drivers
+   inside Windows 11 ARM64 without triggering QEMU device-reset crashes or
+   modifying game binaries.
+
+
+================================================================================
+1. BVM & VM CONFIGURATION MODIFICATIONS (LINUX HOST)
+================================================================================
+
+1.1 Changes to `bvm` (~/.local/share/bvm/bvm, symlink ~/.local/bin/bvm)
+Exact unified diff is stored in `patches/bvm-boot-3d.patch`. Key changes:
+a) `install_dependencies()`:
+   - Add `virgl-server` to `apt_packages`.
+   - Verify `/usr/libexec/virgl_render_server` is executable (required by QEMU Venus).
+b) `unmount_nbd_partitions()`, `mount_qcow2()`, `unmount_qcow2()`:
+   - Unmount automatic desktop udisks2 mounts on `/dev/nbd*p*` before `ntfsfix`
+     and `mount -t ntfs-3g`, and cleanly disconnect `/dev/nbd*` on unmount/error.
+c) `remove_UCPD_from_mountpoint()`:
+   - Check `[ -L "$mountpoint/Windows/System32/drivers/UCPD.sys" ]` in addition to `-e`.
+d) New `boot-3d` mode:
+   - Requires shared `memfd` backing RAM and disables dynamic ballooning (Venus
+     external blob mapping is incompatible with dynamic `virtio-balloon` shrinking):
+       `-M virt,accel=kvm,memory-backend=mem1`
+       `-object "memory-backend-memfd,id=mem1,size=${vm_mem}G,share=on"`
+       (disables `-device virtio-balloon` and the `balloon_popper` background loop)
+   - Enables the 3D GPU device and GTK GL display:
+       `-vga none -device "virtio-gpu-gl-pci,hostmem=${virtio_hostmem:-2G},blob=on,venus=on" -display "gtk,gl=on,grab-on-hover=on..."`
+e) Audio backend ordering:
+   - Prefer `pa` (PulseAudio / `pipewire-pulse` bridge) over QEMU's native `pipewire`
+     audio backend to avoid QEMU BQL deadlock (`pw_thread_loop_lock`) in `boot-3d`.
+f) Appends `"${extra_qemu_flags[@]}"` to `full_qemu_flags`.
+
+Apply patch cleanly:
+  `patch -d ~/.local/share/bvm -p1 < patches/bvm-boot-3d.patch`
+
+1.2 VM Configuration (`~/win11/bvm-config`, see `patches/bvm-config.example`)
+Ensure `~/win11/bvm-config` includes:
+- `vm_mem=8` (recommended 8 GB guest RAM for Win11 ARM64 + OpenGL/Vulkan games)
+- `disable_updates=true` (prevents `bvm` self-update from overwriting your patched `bvm`)
+- Optional SSH port forward (`2222 -> 22`) alongside RDP (`3389`):
+  `network_flags=(-netdev user,id=nic,hostfwd=tcp:127.0.0.1:${rdp_port}-:3389,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=nic)`
+
+
+================================================================================
+2. MESA SOURCE MODIFICATIONS (`src/virtio-win-mesa`)
+================================================================================
+
+Upstream base: `https://github.com/arehnman/virtio-win-mesa`
+Branch: `yttrium-experimental`, base commit `76c095b` (Mesa `26.1.0`).
+Exact unified diff is stored in `patches/virtio-win-mesa.patch`.
+
+2.1 OpenGL 3.3 Core Profile & `GL_ARB_depth_buffer_float` on V3D (`src/gallium/targets/wgl/wgl.c`)
+Why: Host Broadcom V3DV Vulkan does not expose `VK_EXT_transform_feedback` or
+`VK_FORMAT_D32_SFLOAT_S8_UINT`, which caused Zink to fall back to OpenGL 2.1 without
+`GL_ARB_depth_buffer_float`—even though V3DV supports `VK_FORMAT_D32_SFLOAT` and
+OpenGL 3.3 Core Forward-Compatible games (such as Minecraft 26.3 `GlDevice`).
+Change:
+- Include `"util/os_misc.h"`.
+- In `wgl_screen_create_by_name()`, right after `screen = zink_win32_create_screen(luid);`,
+  detect `"V3D"` in `screen->get_name(screen)` and call `os_set_option(..., false)`
+  (`override=false` so explicit user environment variables still take precedence):
+```c
+      if (screen) {
+         use_zink = true;
+         /* V3D Vulkan lacks VK_EXT_transform_feedback and
+          * VK_FORMAT_D32_SFLOAT_S8_UINT, which otherwise caps Zink at GL 2.1
+          * without GL_ARB_depth_buffer_float even though V3D hardware supports
+          * VK_FORMAT_D32_SFLOAT and Core Profile 3.3 applications.
+          */
+         const char *dev_name = screen->get_name ? screen->get_name(screen) : NULL;
+         if (dev_name && strstr(dev_name, "V3D")) {
+            os_set_option("MESA_EXTENSION_OVERRIDE", "+GL_ARB_depth_buffer_float", false);
+            os_set_option("MESA_GL_VERSION_OVERRIDE", "3.3", false);
+            os_set_option("MESA_GLSL_VERSION_OVERRIDE", "330", false);
+         }
+      }
+```
+
+2.2 D3D10/11 UMD (`src/gallium/frontends/d3d10umd/Adapter.cpp`)
+- In `ExposeD3D11_1()`, change default `D3D10UMD_YTTRIUM_ENABLE_FL11_1` from `true` to
+  `false` (Pi 5 V3DV lacks `tessellationShader`; FL11_1 TIR triggers DWM device-loss loops).
+
+2.3 Venus Shared Memory & Display Images for V3D (`src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c`)
+a) Add `yttrium_venus_choose_display_memory_type()`: tries `HOST_VISIBLE | HOST_CACHED`
+   (preferring `HOST_COHERENT`) when `cpu_readback` is requested, and falls back to
+   any `HOST_VISIBLE_BIT` heap on unified-memory GPUs like Broadcom V3D whose single
+   host-visible heap omits `HOST_CACHED_BIT`. Used in both
+   `yttrium_venus2_create_display_image()` and `yttrium_venus_create_shared_public_image()`.
+b) In `yttrium_venus_query_shared_public_image()` & `yttrium_venus_create_shared_public_image()`:
+   derive required format features dynamically from `usage`, and on
+   `VK_ERROR_FORMAT_NOT_SUPPORTED` retry shared public display images with
+   `VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT` (omitting `SAMPLED_BIT`,
+   which V3D does not allow on linear/modifier transfer surfaces).
+c) Add `yttrium_venus_ensure_explicit_export_image()` and invoke it inside
+   `yttrium_venus_create_optimal_shared_storage()`: probes explicit-modifier
+   `VkImageDrmFormatModifierExplicitCreateInfoEXT` creation during export and promotes
+   single-plane `rowPitch` in 32-byte steps up to 256 if V3DV rejects the initial
+   modifier-list `rowPitch` on small `DRM_FORMAT_MOD_BROADCOM_UIF` images.
+
+2.4 Vulkan WSI / Adapter Enumeration (`src/virtio/vulkan/vn_renderer_d3dkmt.c` & `meson.build`)
+- Add `inc_winddk` to `vn_incs` in `src/virtio/vulkan/meson.build`.
+- Load `D3DKMTEnumAdapters2` and `D3DKMTEnumAdapters` in `vn_renderer_d3dkmt.c` and
+  fall back to `virtgpu_open_enumerated_adapter()` / `virtgpu_try_open_adapter()` when
+  `D3DKMTOpenAdapterFromHdc(GetDC(NULL))` cannot open the primary adapter (e.g., Session 0
+  or headless processes).
+
+2.5 `llvm-mingw` ARM64EC / ARM64X Build Compatibility
+- `src/util/detect_arch.h`: recognize `__arm64ec__` / `_M_ARM64EC` as `DETECT_ARCH_AARCH64`
+  and `DETECT_ARCH_ARM64EC`, and exclude `__arm64ec__` from `DETECT_ARCH_X86_64`.
+- `src/gallium/frontends/d3d10umd/Debug.cpp`: restrict `__asm("int3")` to x86 / non-ARM64EC
+  x64, using `__builtin_debugtrap()` for `__clang__`.
+- `src/gallium/frontends/d3d10umd/Resource.cpp`: guard `<emmintrin.h>` and SSE2 fast path
+  in `CopyConstantPublication()` with `!defined(__arm64ec__) && !defined(_M_ARM64EC)`.
+- `src/gallium/winsys/yttrium/gdi/yttrium_context.c`: include `"util/u_atomic.h"` and use
+  `p_atomic_inc_return()` instead of `InterlockedIncrement64()`.
+- `src/vulkan/util/vk_dispatch_table_gen.py` & `vk_entrypoints_gen.py`: extend `_MSC_VER`
+  `vk_entrypoint_stub` handling to `defined(__arm64ec__) || defined(_M_ARM64EC)` and emit
+  `.section .drectve,"yn"` `/alternatename` directives for ARM64EC.
+- `src/gallium/auxiliary/meson.build`: add `inc_winddk` to `libgallium`.
+- `include/winddk/`: generated by `scripts/prepare-winddk.py`, which also creates mixed-case
+  symlinks (`d3d10TokenizedProgramFormat.hpp` and `d3d11TokenizedProgramFormat.hpp`) for
+  case-sensitive Linux filesystems.
+
+
+================================================================================
+3. YTTRIUM KERNEL-MODE DRIVER MODIFICATIONS (`src/yttrium-virtio-gpu`)
+================================================================================
+
+Upstream base: `https://github.com/arehnman/yttrium-virtio-gpu`
+Branch: `yttrium-wddm2`, tag `yttrium-experimental-2026-11-02`, base commit `e9917ae`.
+Exact unified diff is stored in `patches/yttrium-virtio-gpu.patch`.
+
+Why: Previously `VioGpu3DDdiResetFromTimeout`, `VioGpu3DDdiRestartFromTimeout`, and
+`VioGpu3DDdiCollectDbgInfo` returned `STATUS_NOT_SUPPORTED` (`0xC00000BB`), causing an
+immediate `0x116 VIDEO_TDR_FAILURE` BSOD whenever GPU work exceeded Windows' 2s TDR timeout
+(e.g., during Minecraft startup or world generation on Raspberry Pi 5). Furthermore,
+calling `virtio_device_reset()` during TDR triggers QEMU 10.0.13's `blob[4]` duplicate
+QOM property abort.
+
+3.1 `viogpu/shared/viogpu_dma_retirement.h`
+- Add `unsigned RetiredByReset;` field to `VIOGPU_DMA_RETIREMENT` and initialize it to `0`
+  in `VioGpuDmaRetirementPush()`.
+
+3.2 `viogpu/viogpu3d/viogpu_adapter.h` & `viogpu_adapter.cpp`
+- Add `ResetFromTimeout()`, `RestartFromTimeout()`, and `ResetFromTimeoutSync()` to `VioGpuAdapter`.
+- `ResetFromTimeout()` runs `ExecuteSynchronized(ResetFromTimeoutSync, this)` when hardware
+  is initialized, draining `m_dmaRetirement[node][engine]`, marking entries `Failed = 1`
+  and `RetiredByReset = 1`, staging packets to DPC via `CtrlStagePushFromIsr()`, resetting
+  `m_preemptSubmittedOutstanding` / `m_pendingPreemptionFence` / `m_lastNotifiedFence`, and
+  queuing the DPC—**deliberately NOT calling `virtio_device_reset()`**.
+- `InterruptRoutine()` checks `if (cmd->Retirement.RetiredByReset)` and forwards late
+  post-reset completions directly to DPC cleanup without touching post-reset fence state.
+
+3.3 `viogpu/viogpu3d/driver.cpp`
+- Wire `VioGpu3DDdiResetFromTimeout`, `VioGpu3DDdiRestartFromTimeout`, and
+  `VioGpu3DDdiCollectDbgInfo` to `pAdapter->ResetFromTimeout()`,
+  `pAdapter->RestartFromTimeout()`, and parameter-checked `STATUS_SUCCESS`.
+
+3.4 `viogpu/viogpu3d/viogpu3d_arm64_wow64.inx`
+- Set `TdrDelay = 15` and `TdrDdiDelay = 15` (`REG_DWORD`) under
+  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
+
+
+================================================================================
+4. COMPILATION, ARM64X LINKING, PACKAGING, AND SIGNING
+================================================================================
+
+Run all commands from the root of the project (`cd /path/to/win11-arm64-viogpu3d`).
+
+Prerequisites on the build host:
+- Host tools: `bash`, `python3`, `meson`, `ninja`, `cmake`, `curl`, `patch`, `osslsigncode`,
+  `openssl`, `make`, `gcc`/`clang`, `iconv`, `file`.
+- Compiled catalog tool in `src/generate-cat-file/`:
+  `make -C src/generate-cat-file`
+- Populated `toolchain/`:
+  - `toolchain/llvm-mingw/` (Clang 23 + `lld-link`, `llvm-mingw-20261006-ucrt-ubuntu-22.04-aarch64`)
+  - Extracted Microsoft WDK ARM64 & SDK C++ `10.0.26100.6584` NuGet packages under
+    `toolchain/wdk-arm64/`, `toolchain/sdk-cpp/`, `toolchain/sdk-arm64/`, `toolchain/sdk-x86/`
+    (`KITVER=10.0.26100.0`).
+  - If bootstrapping Mesa from a clean tree without `src/virtio-win-mesa/include/winddk/*.h`, run:
+    `python3 scripts/prepare-winddk.py src/virtio-win-mesa <nupkg-files...>`
+
+Step 4.1 — Cross-compile Yttrium Kernel-Mode Driver + user-mode helper services (ARM64)
+  `./scripts/build_kmd_arm64.sh`
+  Outputs (`out/kmd-arm64/`): `viogpu3d.sys`, `viogpuap.exe`, `vgpusrv.exe`.
+
+Step 4.2 — Cross-compile Mesa UMDs (ARM64 + x86)
+  `./scripts/build_mesa.sh`
+  Uses `scripts/meson-aarch64.ini` and `scripts/meson-i686.ini`.
+  Outputs (`out/mesa/{arm64,x86}/`): `viogpu_d3d10.dll`, `viogpu_wgl.dll`,
+  `libvulkan_virtio.dll`, and ICD JSON manifests.
+
+Step 4.3 — Cross-compile Khronos Vulkan-Headers, Vulkan-Loader & Vulkan-Tools (ARM64 + x86)
+  `./scripts/build_vulkan_runtime.sh`
+  Uses `scripts/cmake-aarch64.cmake` and `scripts/cmake-i686.cmake` against `src/vulkan-sdk/`
+  (`vulkan-sdk-1.4.363.0`). Uses existing pre-patched `src/vulkan-sdk/` when present unless
+  `CLEAN_SRC=1` is passed.
+  Outputs (`out/vulkan-sdk/{arm64,x86}/`): `vulkan-1.dll`, `vulkaninfo.exe`.
+
+Step 4.4 — Build ARM64X Hybrid DLLs (Required for Emulated x64 Applications on ARM64)
+Run the wrapper script:
+  `./scripts/build_arm64x.sh`
+(Or run its three steps individually:)
+  1. `./scripts/build_mesa_arm64ec.sh`
+     Configures and compiles `obj-mesa/build-arm64ec/` using `scripts/meson-arm64ec.ini`.
+  2. `python3 ./scripts/link_arm64x.py`
+     Combines `obj-mesa/build-arm64` + `obj-mesa/build-arm64ec` + C++ ctor stubs (`scripts/ctors.c`)
+     via `lld-link -machine:arm64x` and installs the **unstripped** ARM64X hybrid DLLs
+     (`viogpu_d3d10.dll`, `viogpu_wgl.dll`, `libvulkan_virtio.dll`) into `out/mesa/arm64/`.
+     IMPORTANT: Never run `llvm-strip` on ARM64X hybrid DLLs, as it can corrupt CHPE metadata.
+  3. `./scripts/build_vulkan_arm64x.sh`
+     Compiles `arm64ec` Vulkan-Loader + `x64` `vulkaninfo.exe`, links ARM64X `vulkan-1.dll`,
+     and installs them to `out/vulkan-sdk/arm64/vulkan-1.dll` and
+     `out/vulkan-sdk/x64/vulkaninfo_x64.exe`.
+
+Step 4.5 — Generate Test-Signing Certificate (if missing), Package, Generate `.cat` & Sign
+- If `signing/test-signing.key` / `signing/test-signing.crt` are not present (e.g., from a
+  clean GitHub checkout):
+  `./scripts/gen_test_cert.sh`
+- Assemble, catalog-hash (`generate-cat-file`), and Authenticode-sign (`osslsigncode`):
+  `python3 scripts/package_and_sign_arm64.py`
+
+Verified contents of `out/package-arm64/` in the pre-built release kit (signed by
+`CN=Yttrium ARM64 BVM Test Driver Signing, O=Local Test Signing`, SHA-256 fingerprint
+`76:F0:8D:EC:99:7B:04:4B:7C:DA:B5:91:52:12:A6:1C:5A:48:19:E5:66:08:9E:54:B4:01:28:00:DE:E8:D2:6E`):
+- `Install-ARM64-3D.cmd`                      (755 B)
+- `yttrium-test-signing.cer`                  (1,138 B)
+- `driver/viogpu3d.sys`                       (189,896 B, PE=ARM64, signed, SHA256 `252dab382c2ec660446cab8ed0547acabb387d7b22965336d954c2be51cd6fad`)
+- `driver/viogpu3d.inf`                       (5,332 B)
+- `driver/viogpu3d.cat`                       (7,409 B)
+- `driver/vgpusrv.exe`                        (337,352 B, PE=ARM64, signed)
+- `driver/viogpuap.exe`                       (319,944 B, PE=ARM64, signed)
+- `driver/arm64/viogpu_wgl_arm64.dll`         (34,401,224 B, ARM64X CHPE, signed)
+- `driver/arm64/viogpu_d3d10_arm64.dll`       (22,835,144 B, ARM64X CHPE, signed)
+- `driver/arm64/libvulkan_virtio_arm64.dll`   (2,941,384 B, ARM64X CHPE, signed)
+- `driver/arm64/virtio_icd.aarch64.json`      (173 B)
+- `driver/x86/viogpu_wgl_x86.dll`             (21,641,672 B, PE=x86, signed)
+- `driver/x86/viogpu_d3d10_x86.dll`           (12,623,304 B, PE=x86, signed)
+- `driver/x86/libvulkan_virtio_x86.dll`       (2,262,472 B, PE=x86, signed)
+- `driver/x86/virtio_icd.x86.json`            (173 B)
+- `runtime/arm64/vulkan-1.dll`                (1,144,776 B, ARM64X CHPE, signed)
+- `runtime/arm64/vulkaninfo.exe`              (1,923,528 B, PE=ARM64, signed)
+- `runtime/x86/vulkan-1.dll`                  (540,616 B, PE=x86, signed)
+- `runtime/x86/vulkaninfo.exe`                (2,401,224 B, PE=x86, signed)
+
+
+================================================================================
+5. INSTALLATION & SAFE UPGRADE IN WINDOWS 11 ARM64
+================================================================================
+
+5.1 Launch VM in 3D Venus Mode
+On the Linux host, boot the VM with:
+  `bvm boot-3d ~/win11`
+(Note: the upstream `bvm gui` dropdown currently does not expose `boot-3d`; start 3D
+sessions via CLI `bvm boot-3d <vmdir>`.)
+
+5.2 Clean First-Time Installation (No Live `viogpu3d` Active)
+1. Copy the contents of `out/package-arm64/` to `C:\Yttrium-ARM64-3D\` inside Windows 11.
+2. Open an elevated Command Prompt or PowerShell (**Run as Administrator**).
+3. Run:
+     `C:\Yttrium-ARM64-3D\Install-ARM64-3D.cmd`
+   This script trusts `yttrium-test-signing.cer` (`Root` & `TrustedPublisher`), runs
+   `bcdedit /set testsigning on`, disables hibernation, copies `runtime\arm64\vulkan-1.dll`
+   to `C:\Windows\System32\` and `runtime\x86\vulkan-1.dll` to `C:\Windows\SysWOW64\`,
+   and runs `pnputil /add-driver driver\viogpu3d.inf /install`.
+4. Reboot Windows (or cleanly shut down via `shutdown /s /t 0` and start again with
+   `bvm boot-3d ~/win11`).
+
+5.3 CRITICAL PROCEDURE FOR UPGRADING AN ALREADY ACTIVE 3D DRIVER (QEMU 10.0.13)
+WARNING: When `viogpu3d.sys` is already active on `virtio-gpu-gl-pci` with `blob=on`,
+NEVER run `pnputil /add-driver ... /install` or restart the display device while the VM
+is running! QEMU 10.0.13 aborts on warm device reset with:
+  `attempt to add duplicate property 'blob[4]'`
+
+Safe upgrade steps:
+1. Copy the updated `out/package-arm64/` files to `C:\Yttrium-ARM64-3D\`.
+2. Run `scripts\Stage-DriverUpdate-Safe.ps1` as Administrator (or perform manually):
+   - Stages driver WITHOUT `/install`: `pnputil.exe /add-driver C:\Yttrium-ARM64-3D\driver\viogpu3d.inf`
+   - Updates `HKLM\SYSTEM\CurrentControlSet\Services\viogpu3d\ImagePath` and
+     `...\Services\vgpusrv\ImagePath` to the newly staged DriverStore folder matching
+     the SHA256 of `viogpu3d.sys`.
+   - Copies ARM64X `vulkan-1.dll` -> `C:\Windows\System32\vulkan-1.dll` and x86
+     `vulkan-1.dll` -> `C:\Windows\SysWOW64\vulkan-1.dll`.
+   - Ensures `TdrDelay = 15`, `TdrDdiDelay = 15` (`REG_DWORD`) under
+     `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, and `PagingFiles = C:\pagefile.sys 0 0`.
+   - Removes any stale `C:\ProgramData\Yttrium\yttrium.ini`.
+3. Shut down Windows completely:
+     `shutdown /s /t 0`
+4. Wait for QEMU to exit on the host, then cold-boot again with:
+     `bvm boot-3d ~/win11`
+
+
+================================================================================
+6. VERIFICATION & MINECRAFT / TLAUNCHER NOTES
+================================================================================
+
+6.1 Guest Verification (Run from Interactive Session 1 Desktop, Not Pure SSH Session 0)
+1. Confirm KMD & disk state in PowerShell:
+   - `Get-CimInstance Win32_SystemDriver -Filter "Name='viogpu3d'"` -> `State=Running`, `Status=OK`
+   - `fsutil dirty query C:` -> `Volume - C: is NOT Dirty`
+   - `TdrDelay` and `TdrDdiDelay` are `15`.
+2. Run multi-arch checks (compile reference probes from `scripts/gl_d3d_probe.cpp` &
+   `tests/*.cpp` using `llvm-mingw` for `arm64`, `i686`, `x86_64`):
+   - `vulkaninfo.exe --summary` (ARM64, x86, x64) -> `GPU0: Virtio-GPU Venus (V3D 7.1.10.2)` (`apiVersion 1.3.0`)
+   - `gl_d3d_probe` (ARM64, x86, x64) -> `DXGI[0]: Yttrium VirtIO GPU 3D controller`,
+     `D3D11 HW : OK (feature level 0xb000)`,
+     `GL_RENDERER : zink Vulkan 1.3(Virtio-GPU Venus (V3D 7.1.10.2) (MESA_VENUS))`,
+     `GL_VERSION : 3.3 (Compatibility Profile) Mesa 26.1.0`, `OpenGL draw : OK (err=0x0)`
+   - `test_mc_gl2` (SDL3 OpenGL 3.3 Core & Core Forward-Compatible) -> `err='OK'`
+   - `test_depth32f` (`GL_DEPTH_COMPONENT32F` + FBO) -> `FBO status=0x8cd5 (0x8CD5=COMPLETE) err=0x0`
+
+6.2 TLauncher & Minecraft 26.3 Notes
+- Neither `TLauncher.jar` nor `26.3.jar` needs any modification, and no `MESA_*` / `ZINK_*`
+  environment variables are required (`viogpu_wgl.dll` enables OpenGL 3.3 Core +
+  `GL_ARB_depth_buffer_float` automatically when running on V3D).
+- Inside an 8 GB VM (`vm_mem=8`), allocating `3072 MB` to Minecraft in TLauncher settings
+  (`minecraft.memory.ram3=3072`) alongside a system-managed `C:\pagefile.sys` avoids
+  host RAM/ZRAM thrashing from Java `-XX:+AlwaysPreTouch`.
+- Be patient during first world generation on Raspberry Pi 5 (`Time elapsed: 222461 ms`
+  observed for initial `New World (1)` spawn generation); with `TdrDelay=15` and
+  `ResetFromTimeout`, Minecraft loads cleanly into the live 3D world with zero TDR crashes.
+
+================================================================================
+END OF GUIDE
+================================================================================

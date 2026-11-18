@@ -1,0 +1,23 @@
+# Toolchain & downloaded archives (fetch/extract locally before rebuilding from source)
+/cache/
+/toolchain/
+
+# Intermediate build objects
+/obj-kmd-arm64/
+/obj-mesa/
+/obj-vulkan/
+/out/kmd-arm64/
+/out/mesa/
+/out/vulkan-sdk/
+
+# Never commit private test-signing keys, unpacked nested .git directories, or dangling WDK case symlinks
+/signing/test-signing.key
+/signing/test-signing.crt
+src/virtio-win-mesa/include/winddk/d3d10TokenizedProgramFormat.hpp
+src/virtio-win-mesa/include/winddk/d3d11TokenizedProgramFormat.hpp
+**/.git/
+*.zip
+*.log
+*.o
+*.obj
+*.pdb

@@ -1,0 +1,204 @@
+diff --git a/viogpu/shared/viogpu_dma_retirement.h b/viogpu/shared/viogpu_dma_retirement.h
+index a7c0097..d6aee90 100644
+--- a/viogpu/shared/viogpu_dma_retirement.h
++++ b/viogpu/shared/viogpu_dma_retirement.h
+@@ -13,6 +13,7 @@ typedef struct _VIOGPU_DMA_RETIREMENT
+     void *Packet;
+     unsigned Length;
+     unsigned Failed;
++    unsigned RetiredByReset;
+ } VIOGPU_DMA_RETIREMENT;
+ 
+ typedef struct _VIOGPU_DMA_RETIREMENT_QUEUE
+@@ -27,6 +28,7 @@ static inline void VioGpuDmaRetirementPush(VIOGPU_DMA_RETIREMENT_QUEUE *queue,
+     entry->Packet = 0;
+     entry->Length = 0;
+     entry->Failed = 0;
++    entry->RetiredByReset = 0;
+     if (queue->Tail) queue->Tail->Next = entry;
+     else queue->Head = entry;
+     queue->Tail = entry;
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index c830870..3321467 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -1448,10 +1448,15 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiRestartFromTimeout(_In_ CONST HANDLE hAdapter)
+ {
+-    UNREFERENCED_PARAMETER(hAdapter);
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
++    VIOGPU_ASSERT_CHK(hAdapter != NULL);
+ 
+-    return STATUS_NOT_SUPPORTED;
++    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
++    if (!pAdapter->IsDriverActive())
++    {
++        return STATUS_SUCCESS;
++    }
++
++    return pAdapter->RestartFromTimeout();
+ };
+ 
+ NTSTATUS
+@@ -1510,22 +1515,27 @@ APIENTRY
+ VioGpu3DDdiCollectDbgInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_COLLECTDBGINFO *pCollectDbgInfo)
+ {
+     UNREFERENCED_PARAMETER(hAdapter);
+-    UNREFERENCED_PARAMETER(pCollectDbgInfo);
+-
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
++    if (!pCollectDbgInfo)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
+ 
+-    return STATUS_NOT_SUPPORTED;
++    return STATUS_SUCCESS;
+ };
+ 
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiResetFromTimeout(_In_ CONST HANDLE hAdapter)
+ {
+-    UNREFERENCED_PARAMETER(hAdapter);
++    VIOGPU_ASSERT_CHK(hAdapter != NULL);
+ 
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
++    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
++    if (!pAdapter->IsDriverActive())
++    {
++        return STATUS_SUCCESS;
++    }
+ 
+-    return STATUS_NOT_SUPPORTED;
++    return pAdapter->ResetFromTimeout();
+ };
+ 
+ #if defined(DBG)
+diff --git a/viogpu/viogpu3d/viogpu3d_arm64_wow64.inx b/viogpu/viogpu3d/viogpu3d_arm64_wow64.inx
+index e985064..3074b93 100644
+--- a/viogpu/viogpu3d/viogpu3d_arm64_wow64.inx
++++ b/viogpu/viogpu3d/viogpu3d_arm64_wow64.inx
+@@ -137,6 +137,8 @@ HKLM,"SOFTWARE\Khronos\Vulkan\Drivers","%11%\virtio_icd.aarch64.json",%REG_DWORD
+ HKLM,"SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers","%16425%\lvp_icd.x86.json",%REG_DWORD%,0
+ HKLM,"SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers","%16425%\virtio_icd.x86.json",%REG_DWORD%,0
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,1
++HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDelay,%REG_DWORD%,15
++HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDdiDelay,%REG_DWORD%,15
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
+ 
+ [VioGpu3D_PCI_MSIX]
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index c68334c..9ddd069 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -2287,6 +2287,73 @@ VOID VioGpuAdapter::ResetDevice(VOID)
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+ }
+ 
++BOOLEAN VioGpuAdapter::ResetFromTimeoutSync(void *opaque)
++{
++    VioGpuAdapter *adapter = static_cast<VioGpuAdapter *>(opaque);
++    BOOLEAN stagedAny = FALSE;
++
++    for (UINT node = 0; node < kMaxTrackedNodes; ++node)
++    {
++        for (UINT engine = 0; engine < kMaxTrackedEngines; ++engine)
++        {
++            VIOGPU_DMA_RETIREMENT_QUEUE *queue = &adapter->m_dmaRetirement[node][engine];
++            while (queue->Head)
++            {
++                VIOGPU_DMA_RETIREMENT *entry = queue->Head;
++                queue->Head = entry->Next;
++                entry->Next = NULL;
++                entry->Failed = 1;
++                entry->RetiredByReset = 1;
++                if (entry->Packet)
++                {
++                    PGPU_VBUFFER packet = static_cast<PGPU_VBUFFER>(entry->Packet);
++                    const UINT packetLen = entry->Length;
++                    entry->Packet = NULL;
++                    entry->Length = 0;
++                    adapter->CtrlStagePushFromIsr(packet, packetLen);
++                    stagedAny = TRUE;
++                }
++            }
++            queue->Tail = NULL;
++
++            InterlockedExchange(&adapter->m_preemptSubmittedOutstanding[node][engine], 0);
++            InterlockedExchange(&adapter->m_pendingPreemptionFence[node][engine], 0);
++            InterlockedExchange(&adapter->m_lastNotifiedFence[node][engine], 0);
++        }
++    }
++
++    if (stagedAny)
++    {
++        InterlockedOr((PLONG)&adapter->m_PendingWorks, ISR_REASON_DISPLAY);
++        adapter->m_DxgkInterface.DxgkCbQueueDpc(adapter->m_DxgkInterface.DeviceHandle);
++    }
++
++    return TRUE;
++}
++
++NTSTATUS VioGpuAdapter::ResetFromTimeout(VOID)
++{
++    DbgPrint(TRACE_LEVEL_WARNING, ("---> %s draining pending DMA retirement state\n", __FUNCTION__));
++
++    if (IsHardwareInit())
++    {
++        // Do not call virtio_device_reset here: QEMU 10's virtio-gpu-gl-device
++        // retains blob QOM properties across device resets and aborts if new
++        // blobs reuse IDs. Drain/detach KMD tracking safely and keep the
++        // host virgl/Venus device intact.
++        ExecuteSynchronized(ResetFromTimeoutSync, this);
++    }
++
++    DbgPrint(TRACE_LEVEL_WARNING, ("<--- %s\n", __FUNCTION__));
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS VioGpuAdapter::RestartFromTimeout(VOID)
++{
++    DbgPrint(TRACE_LEVEL_WARNING, ("<---> %s\n", __FUNCTION__));
++    return STATUS_SUCCESS;
++}
++
+ #pragma code_seg(pop) // End Non-Paged Code
+ 
+ PAGED_CODE_SEG_BEGIN
+@@ -3176,6 +3243,13 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
+                     UINT engineOrdinal = 0;
+                     if (cmd->OnPacketCompletedFromIsr(&fenceId, &nodeOrdinal, &engineOrdinal))
+                     {
++                        if (cmd->Retirement.RetiredByReset)
++                        {
++                            // Packet belonged to a submission retired during TDR reset;
++                            // release via DPC without touching post-reset fence tracking.
++                            CtrlStagePushFromIsr(pvbuf, len);
++                            continue;
++                        }
+                         // Hold the final packet reference until every older DMA
+                         // on this engine has completed. A CPU/legacy timeline
+                         // response must never overtake a pending GPU timeline.
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index ecc0d12..6e2b2aa 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -210,6 +210,8 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+                          _Out_ ULONG *pNumberOfChildren);
+     NTSTATUS StopDevice(VOID);
+     VOID ResetDevice(VOID);
++    NTSTATUS ResetFromTimeout(VOID);
++    NTSTATUS RestartFromTimeout(VOID);
+     NTSTATUS DispatchIoRequest(_In_ ULONG VidPnSourceId, _In_ VIDEO_REQUEST_PACKET *pVideoRequestPacket);
+     NTSTATUS SetPowerState(_In_ ULONG HardwareUid,
+                            _In_ DEVICE_POWER_STATE DevicePowerState,
+@@ -331,6 +333,7 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     BOOLEAN InterruptRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface, _In_ ULONG MessageNumber);
+     VOID DpcRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface);
+     VOID CtrlStagePushFromIsr(PGPU_VBUFFER buf, UINT len);
++    static BOOLEAN ResetFromTimeoutSync(void *opaque);
+     BOOLEAN CtrlStagePopForDpc(PGPU_VBUFFER *buf, UINT *len);
+     VOID ProcessCtrlQueueBuffer(PGPU_VBUFFER pvbuf, UINT len);
+     void NotifyDmaPreempted(UINT preemptionFenceId,

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Example BVM VM configuration for Windows 11 ARM64 + Venus 3D acceleration on Raspberry Pi 5.
+# Copy relevant settings into ~/win11/bvm-config (do not overwrite your existing username/password if already installed).
+
+vm_username="Win11ARM"
+vm_password="win11arm"
+download_language="English (United States)"
+debloat=true
+disksize=40
+rdp_port=3389
+
+# Recommended 8 GB guest RAM for Win11 ARM64 + OpenGL/Vulkan games (used as memfd size in bvm boot-3d)
+vm_mem=8
+
+# Prevent `bvm` self-update from overwriting local boot-3d patches
+disable_updates=true
+
+# Forward guest RDP (3389) and optional OpenSSH (2222 -> 22) to localhost
+network_flags=(-netdev user,id=nic,hostfwd=tcp:127.0.0.1:${rdp_port}-:3389,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=nic)
+
+# Optional overrides used by `bvm boot-3d`:
+# virtio_hostmem=2G
+# extra_qemu_flags=()

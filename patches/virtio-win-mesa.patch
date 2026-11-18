@@ -1,0 +1,764 @@
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index edac06d..ef4fe9f 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -503,7 +503,7 @@ libgallium = static_library(
+   'gallium',
+   [files_libgallium, u_indices_gen_c, u_unfilled_gen_c],
+   include_directories : [
+-    inc_loader, inc_gallium, inc_src, inc_include, include_directories('util')
++    inc_loader, inc_gallium, inc_src, inc_include, inc_winddk, include_directories('util')
+   ],
+   c_args : [c_msvc_compat_args, libgallium_extra_c_args],
+   cpp_args : [cpp_msvc_compat_args],
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index b9d75f8..24a5957 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -53,8 +53,9 @@ static unsigned long memdbg_no = 0;
+ static bool
+ ExposeD3D11_1()
+ {
++   /* Pi 5 V3DV lacks tessellationShader; FL11_1 TIR triggers DWM device-loss loops. */
+    return yttrium_gdi_debug_get_bool_option(
+-      "D3D10UMD_YTTRIUM_ENABLE_FL11_1", true);
++      "D3D10UMD_YTTRIUM_ENABLE_FL11_1", false);
+ }
+ #endif
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Debug.cpp b/src/gallium/frontends/d3d10umd/Debug.cpp
+index 648761c..4aea9b8 100644
+--- a/src/gallium/frontends/d3d10umd/Debug.cpp
++++ b/src/gallium/frontends/d3d10umd/Debug.cpp
+@@ -151,8 +151,10 @@ AssertFail(const char *expr,
+    yttrium_gdi_trace_errorf("%s:%u:%s: Assertion `%s' failed.\n",
+                             file, line, function, expr);
+    DebugPrintf("%s:%u:%s: Assertion `%s' failed.\n", file, line, function, expr);
+-#if defined(__GNUC__)
++#if defined(__GNUC__) && (defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__)))
+    __asm("int3");
++#elif defined(__clang__)
++   __builtin_debugtrap();
+ #elif defined(_MSC_VER)
+    __debugbreak();
+ #else
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 7b06c02..b3c07cd 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -49,7 +49,7 @@
+ 
+ #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+ 
+-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
++#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+ #include <emmintrin.h>
+ #endif
+ #include <stdlib.h>
+@@ -61,7 +61,7 @@
+ static void
+ CopyConstantPublication(void *dst, const void *src, size_t size)
+ {
+-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
++#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+    if (size >= CONSTANT_PUBLICATION_NONTEMPORAL_MIN_SIZE &&
+        !(reinterpret_cast<uintptr_t>(dst) & 15u) && !(size & 15u)) {
+       __m128i *dst_vec = reinterpret_cast<__m128i *>(dst);
+diff --git a/src/gallium/targets/wgl/wgl.c b/src/gallium/targets/wgl/wgl.c
+index b88d71c..75e533d 100644
+--- a/src/gallium/targets/wgl/wgl.c
++++ b/src/gallium/targets/wgl/wgl.c
+@@ -37,6 +37,7 @@
+ #include <windows.h>
+ 
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/u_debug.h"
+ #include "stw_winsys.h"
+ #include "stw_device.h"
+@@ -126,8 +127,20 @@ wgl_screen_create_by_name(HDC hDC, const char* driver, struct sw_winsys *winsys)
+       memcpy(&luid, &adapter_luid, sizeof(luid));
+ 
+       screen = zink_win32_create_screen(luid);
+-      if (screen)
++      if (screen) {
+          use_zink = true;
++         /* V3D Vulkan lacks VK_EXT_transform_feedback and
++          * VK_FORMAT_D32_SFLOAT_S8_UINT, which otherwise caps Zink at GL 2.1
++          * without GL_ARB_depth_buffer_float even though V3D hardware supports
++          * VK_FORMAT_D32_SFLOAT and Core Profile 3.3 applications.
++          */
++         const char *dev_name = screen->get_name ? screen->get_name(screen) : NULL;
++         if (dev_name && strstr(dev_name, "V3D")) {
++            os_set_option("MESA_EXTENSION_OVERRIDE", "+GL_ARB_depth_buffer_float", false);
++            os_set_option("MESA_GL_VERSION_OVERRIDE", "3.3", false);
++            os_set_option("MESA_GLSL_VERSION_OVERRIDE", "330", false);
++         }
++      }
+    }
+ #endif
+ #ifdef GALLIUM_SOFTPIPE
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_context.c b/src/gallium/winsys/yttrium/gdi/yttrium_context.c
+index 0761ac2..69c0016 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_context.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_context.c
+@@ -11,6 +11,7 @@
+ #include <winternl.h>
+ 
+ #include "util/u_prim.h"
++#include "util/u_atomic.h"
+ #include "util/u_framebuffer.h"
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+@@ -469,7 +470,7 @@ yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
+    issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
+    issuance->device = yttrium_screen(ctx->screen)->device;
+    issuance->id =
+-      (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
++      (uint64_t)p_atomic_inc_return(&yttrium_next_flush_issuance_id);
+ 
+    if (ctx->flush != yttrium_flush) {
+       if (!yttrium_threaded_queue_flush_label(
+@@ -597,7 +598,7 @@ yttrium_gdi_flush_async_present(
+ 
+    ticket->publish = *publish;
+    ticket->id =
+-      (uint64_t)InterlockedIncrement64(&yttrium_next_present_ticket_id);
++      (uint64_t)p_atomic_inc_return(&yttrium_next_present_ticket_id);
+ 
+    struct yttrium_gdi_flush_issuance *issuance = NULL;
+    if (issued) {
+@@ -609,7 +610,7 @@ yttrium_gdi_flush_async_present(
+       issuance->references = 2;
+       issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
+       issuance->device = yttrium_screen(ctx->screen)->device;
+-      issuance->id = (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
++      issuance->id = (uint64_t)p_atomic_inc_return(&yttrium_next_flush_issuance_id);
+    }
+ 
+    if (ctx->flush != yttrium_flush) {
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
+index b4a8b75..eb1322f 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
+@@ -406,6 +406,30 @@ yttrium_venus_get_image_subresource_layout_checked(
+    return true;
+ }
+ 
++/* Prefer host-cached memory for CPU readback when available, while falling back
++ * to any host-visible (coherent-preferred) heap on unified architectures such
++ * as Broadcom V3D whose single host-visible heap omits HOST_CACHED_BIT. */
++static uint32_t
++yttrium_venus_choose_display_memory_type(struct yttrium_venus *venus,
++                                         uint32_t memory_type_bits,
++                                         bool cpu_readback)
++{
++   if (cpu_readback) {
++      const uint32_t cached = yttrium_venus_choose_memory_type(
++         venus, memory_type_bits,
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++      if (cached != UINT32_MAX)
++         return cached;
++   }
++   return yttrium_venus_choose_memory_type(
++      venus, memory_type_bits,
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
++      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++         (cpu_readback ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
++}
++
+ static bool
+ yttrium_venus_create_image_tiled(struct yttrium_venus *venus,
+                                  struct yttrium_venus_resource *resource,
+@@ -760,20 +784,13 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
+     * A legacy BAR can satisfy this preference while it has space; otherwise
+     * the chooser falls back to any host-visible type.
+     */
+-   const VkMemoryPropertyFlags required_memory =
+-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-      (resource->cpu_readback ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+-   const VkMemoryPropertyFlags preferred_memory =
+-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-      (resource->cpu_readback ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const uint32_t memory_type_index =
+-      yttrium_venus_choose_memory_type(venus, reqs.memoryTypeBits,
+-                                       required_memory, preferred_memory);
++      yttrium_venus_choose_display_memory_type(
++         venus, reqs.memoryTypeBits, resource->cpu_readback);
+    if (memory_type_index == UINT32_MAX) {
+-      YTTRIUM_LOG("yttrium: Venus no compatible memory type for display image bits=0x%x %ux%u format=%u req_size=0x%llx cpu_readback=%u required=0x%x preferred=0x%x\n",
++      YTTRIUM_LOG("yttrium: Venus no compatible memory type for display image bits=0x%x %ux%u format=%u req_size=0x%llx cpu_readback=%u\n",
+                    reqs.memoryTypeBits, width, height, pipe_format,
+-                   (unsigned long long)reqs.size, resource->cpu_readback,
+-                   required_memory, preferred_memory);
++                   (unsigned long long)reqs.size, resource->cpu_readback);
+       vn_async_vkDestroyImage(&venus->vn_ring, venus->device_handle,
+                               resource->image, NULL);
+       memset(resource, 0, sizeof(*resource));
+@@ -880,9 +897,14 @@ yttrium_venus_query_shared_public_image(
+    memset(external_memory, 0, sizeof(*external_memory));
+    if (drm && !venus->image_drm_format_modifier)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+-   const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+-      VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++   const VkFormatFeatureFlags required =
++      ((usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ?
++         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT : 0) |
++      ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ?
++         VK_FORMAT_FEATURE_TRANSFER_DST_BIT : 0) |
++      ((usage & VK_IMAGE_USAGE_SAMPLED_BIT) ?
++         (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) : 0);
+    for (unsigned i = 0; i < 2; i++) {
+       if (drm) {
+          VkDrmFormatModifierPropertiesEXT *modifiers;
+@@ -969,7 +991,7 @@ yttrium_venus_create_shared_public_image(
+    if (!yttrium_venus_shared_color_formats(pipe_format, views) ||
+        !yttrium_venus_ensure_initialized(venus) || !venus->shared_image_supported)
+       return false;
+-   const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++   VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    VkExternalMemoryProperties external_memory;
+@@ -984,6 +1006,30 @@ yttrium_venus_create_shared_public_image(
+       result = yttrium_venus_query_shared_public_image(
+          venus, width, height, views, usage, flags, true, &external_memory);
+    }
++   /* Some GPUs (such as Broadcom V3D) support LINEAR / DRM_FORMAT_MOD_LINEAR
++    * transfers without direct sampling. Public display endpoints only need
++    * transfer operations. */
++   if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
++      const VkImageUsageFlags transfer_usage =
++         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      bool transfer_drm = false;
++      VkResult transfer_result = yttrium_venus_query_shared_public_image(
++         venus, width, height, views, transfer_usage, flags, false,
++         &external_memory);
++      if (transfer_result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
++         transfer_drm = true;
++         transfer_result = yttrium_venus_query_shared_public_image(
++            venus, width, height, views, transfer_usage, flags, true,
++            &external_memory);
++      }
++      if (transfer_result == VK_SUCCESS) {
++         usage = transfer_usage;
++         drm = transfer_drm;
++         result = transfer_result;
++         YTTRIUM_LOG("yttrium: shared public image fallback without SAMPLED_BIT owner=venus2 drm=%u extent=%ux%u\n",
++                     drm ? 1u : 0u, width, height);
++      }
++   }
+    if (result != VK_SUCCESS) {
+       YTTRIUM_WARN("yttrium: ERROR shared public image external query rejected owner=venus2 legacy_result=%d selected_result=%d extent=%ux%u features=0x%x action=fail-image\n",
+                    legacy_result, result, width, height,
+@@ -1061,15 +1107,9 @@ yttrium_venus_create_shared_public_image(
+     * display image. Preserve its readback policy instead of selecting a
+     * device-local, write-combined backing for a CPU-readable resource.
+     */
+-   const VkMemoryPropertyFlags required_memory =
+-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-      (resource->cpu_readback ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+-   const VkMemoryPropertyFlags preferred_memory =
+-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-      (resource->cpu_readback ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+-   const uint32_t memory_type = yttrium_venus_choose_memory_type(
++   const uint32_t memory_type = yttrium_venus_choose_display_memory_type(
+       venus, reqs->memoryTypeBits & memory_properties.memoryTypeBits,
+-      required_memory, preferred_memory);
++      resource->cpu_readback);
+    if (!reqs->size || memory_type == UINT32_MAX ||
+        (allocation && reqs->size > allocation->Size))
+       goto discard_image;
+@@ -1456,6 +1496,106 @@ yttrium_venus_shared_memory_type(
+ /* Both endpoints recreate the creator's exact image descriptor. Version 4
+  * uses DMA_BUF with explicit modifier planes; version 2 remains readable for
+  * existing OPAQUE_FD allocations while processes transition to the new UMD. */
++/* Some host drivers (notably V3DV for small DRM_FORMAT_MOD_BROADCOM_UIF images)
++ * report a rowPitch from modifier-list creation that explicit-modifier import
++ * rejects with VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT. Probe
++ * explicit creation during export and promote the plane rowPitch to the minimum
++ * accepted alignment before allocating/exporting memory. */
++static bool
++yttrium_venus_ensure_explicit_export_image(
++   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
++   const VkImageCreateInfo *modifier_create,
++   const VkExternalMemoryImageCreateInfo *external_image,
++   const VkImageFormatListCreateInfo *format_list,
++   const struct yttrium_optimal_image_data *data,
++   uint32_t width, uint32_t height)
++{
++   VkSubresourceLayout plane_layouts[YTTRIUM_OPTIMAL_IMAGE_MAX_DRM_PLANES] = {0};
++   for (uint32_t i = 0; i < data->drm_plane_count; i++) {
++      const VkImageSubresource subresource = {
++         .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i,
++      };
++      VkSubresourceLayout layout = {0};
++      if (!yttrium_venus_get_image_subresource_layout_checked(
++             venus, resource, &subresource, &layout, "DMA_BUF-export-probe") ||
++          !layout.rowPitch)
++         return true;
++      plane_layouts[i].offset = layout.offset;
++      plane_layouts[i].rowPitch = layout.rowPitch;
++   }
++
++   const VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_modifier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = data->drm_modifier,
++      .drmFormatModifierPlaneCount = data->drm_plane_count,
++      .pPlaneLayouts = plane_layouts,
++   };
++   VkImageFormatListCreateInfo explicit_format_list = *format_list;
++   explicit_format_list.pNext = &explicit_modifier;
++   VkExternalMemoryImageCreateInfo explicit_ext = *external_image;
++   explicit_ext.pNext = &explicit_format_list;
++   VkImageCreateInfo explicit_create = *modifier_create;
++   explicit_create.pNext = &explicit_ext;
++
++   struct yttrium_venus_object probe_obj;
++   yttrium_venus_init_object(venus, &probe_obj);
++   VkImage probe_img = YTTRIUM_VENUS_HANDLE(VkImage, &probe_obj);
++   VkResult res = vn_call_vkCreateImage(
++      &venus->vn_ring, venus->device_handle, &explicit_create, NULL, &probe_img);
++   if (venus->failed) {
++      yttrium_venus_discard_accepted_image(venus, resource, false);
++      return false;
++   }
++   if (res == VK_SUCCESS) {
++      vn_async_vkDestroyImage(&venus->vn_ring, venus->device_handle, probe_img, NULL);
++      return true;
++   }
++   if (res != VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT ||
++       data->drm_plane_count != 1)
++      return true;
++
++   const uint64_t orig_pitch = plane_layouts[0].rowPitch;
++   bool accepted = false;
++   for (uint64_t step = 32; step <= 256; step += 32) {
++      if (orig_pitch >= step)
++         continue;
++      plane_layouts[0].rowPitch = step;
++      yttrium_venus_init_object(venus, &probe_obj);
++      probe_img = YTTRIUM_VENUS_HANDLE(VkImage, &probe_obj);
++      res = vn_call_vkCreateImage(&venus->vn_ring, venus->device_handle,
++                                  &explicit_create, NULL, &probe_img);
++      if (venus->failed) {
++         yttrium_venus_discard_accepted_image(venus, resource, false);
++         return false;
++      }
++      if (res == VK_SUCCESS) {
++         vn_async_vkDestroyImage(&venus->vn_ring, venus->device_handle, probe_img, NULL);
++         accepted = true;
++         break;
++      }
++   }
++   if (!accepted)
++      return true;
++
++   vn_async_vkDestroyImage(&venus->vn_ring, venus->device_handle,
++                           resource->image, NULL);
++   yttrium_venus_init_object(venus, &resource->image_obj);
++   resource->image = YTTRIUM_VENUS_HANDLE(VkImage, &resource->image_obj);
++   res = vn_call_vkCreateImage(&venus->vn_ring, venus->device_handle,
++                               &explicit_create, NULL, &resource->image);
++   if (res != VK_SUCCESS) {
++      YTTRIUM_WARN("yttrium: ERROR optimal shared explicit recreate failed owner=venus2 result=%d pitch=%llu action=fail-image\n",
++                   res, (unsigned long long)plane_layouts[0].rowPitch);
++      resource->image = VK_NULL_HANDLE;
++      return false;
++   }
++   YTTRIUM_LOG("yttrium: optimal shared image explicit pitch adjusted owner=venus2 modifier=0x%llx extent=%ux%u format=%u pitch=%llu->%llu\n",
++               (unsigned long long)data->drm_modifier, width, height,
++               data->vk_format, (unsigned long long)orig_pitch,
++               (unsigned long long)plane_layouts[0].rowPitch);
++   return true;
++}
++
+ static bool
+ yttrium_venus_create_optimal_shared_storage(
+    struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+@@ -1580,6 +1720,12 @@ yttrium_venus_create_optimal_shared_storage(
+       resource->image = VK_NULL_HANDLE;
+       return false;
+    }
++   if (drm && !resource_id &&
++       !yttrium_venus_ensure_explicit_export_image(
++          venus, resource, &create, &external_image, &shared_format_list,
++          data, width, height)) {
++      return false;
++   }
+    VkMemoryDedicatedRequirements dedicated = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+    };
+diff --git a/src/util/detect_arch.h b/src/util/detect_arch.h
+index e32de8d..d17a0d5 100644
+--- a/src/util/detect_arch.h
++++ b/src/util/detect_arch.h
+@@ -58,9 +58,8 @@
+ #define DETECT_ARCH_X86 1
+ #endif
+ 
+-#if defined(__x86_64__) /* gcc */ || \
+-    ((defined(_M_X64) || defined(_M_AMD64)) && !defined(_M_ARM64EC)) /* msvc */ || \
+-    defined(__x86_64) /* Sun cc */
++#if ((defined(__x86_64__) || defined(__x86_64)) && !defined(__arm64ec__)) /* gcc/Sun cc */ || \
++    ((defined(_M_X64) || defined(_M_AMD64)) && !defined(_M_ARM64EC)) /* msvc */
+ #define DETECT_ARCH_X86_64 1
+ #endif
+ 
+@@ -87,11 +86,11 @@
+ #define DETECT_ARCH_ARM 1
+ #endif
+ 
+-#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
++#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__)
+ #define DETECT_ARCH_AARCH64 1
+ #endif
+ 
+-#if defined(_M_ARM64EC)
++#if defined(_M_ARM64EC) || defined(__arm64ec__)
+ #define DETECT_ARCH_ARM64EC 1
+ #endif
+ 
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index acfa614..c83fe82 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -116,6 +116,7 @@ if not with_platform_windows
+ endif
+ 
+ if with_platform_windows
++  vn_incs += inc_winddk
+   libvn_files += files('vn_renderer_d3dkmt.c')
+   libvn_files += files('vn_wsi.c')
+   vn_c_args += '-DVN_USE_WSI_PLATFORM'
+diff --git a/src/virtio/vulkan/vn_renderer_d3dkmt.c b/src/virtio/vulkan/vn_renderer_d3dkmt.c
+index 0ce4858..a44d61f 100644
+--- a/src/virtio/vulkan/vn_renderer_d3dkmt.c
++++ b/src/virtio/vulkan/vn_renderer_d3dkmt.c
+@@ -162,6 +162,8 @@ struct virtgpu {
+    PFND3DKMT_OPENRESOURCE pfnOpenResource;
+ #endif
+    PFND3DKMT_OPENADAPTERFROMHDC pfnOpenAdapterFromHdc;
++   PFND3DKMT_ENUMADAPTERS pfnEnumAdapters;
++   PFND3DKMT_ENUMADAPTERS2 pfnEnumAdapters2;
+    PFND3DKMT_CLOSEADAPTER pfnCloseAdapter;
+    D3DKMT_HANDLE hAdapter;
+    LUID adapter_luid;
+@@ -994,6 +996,10 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
+    gpu->pfnOpenAdapterFromHdc =
+       (PFND3DKMT_OPENADAPTERFROMHDC)GetProcAddress(gpu->gdi32,
+                                                    "D3DKMTOpenAdapterFromHdc");
++   gpu->pfnEnumAdapters = (PFND3DKMT_ENUMADAPTERS)GetProcAddress(
++      gpu->gdi32, "D3DKMTEnumAdapters");
++   gpu->pfnEnumAdapters2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(
++      gpu->gdi32, "D3DKMTEnumAdapters2");
+    gpu->pfnCloseAdapter = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(
+       gpu->gdi32, "D3DKMTCloseAdapter");
+ 
+@@ -1044,6 +1050,8 @@ virtgpu_unload_d3dkmt(struct virtgpu *gpu)
+    gpu->pfnShareObjects = NULL;
+    gpu->pfnOpenResourceFromNtHandle = NULL;
+    gpu->pfnOpenAdapterFromHdc = NULL;
++   gpu->pfnEnumAdapters = NULL;
++   gpu->pfnEnumAdapters2 = NULL;
+    gpu->pfnCloseAdapter = NULL;
+ }
+ 
+@@ -2096,68 +2104,33 @@ err:
+    return VK_ERROR_INITIALIZATION_FAILED;
+ }
+ 
+-static VkResult
+-virtgpu_open(struct virtgpu *gpu)
++static bool
++virtgpu_try_open_adapter(struct virtgpu *gpu,
++                         D3DKMT_HANDLE hAdapter,
++                         LUID adapter_luid)
+ {
+-   if (!virtgpu_load_d3dkmt(gpu)) {
+-      vn_log(gpu->instance, "failed to load D3DKMT entrypoints");
+-      return VK_ERROR_INITIALIZATION_FAILED;
+-   }
+-
+-   HDC hdc = GetDC(NULL);
+-   if (!hdc) {
+-      vn_log(gpu->instance, "failed to get primary HDC");
+-      virtgpu_unload_d3dkmt(gpu);
+-      return VK_ERROR_INITIALIZATION_FAILED;
+-   }
+-
+-   D3DKMT_OPENADAPTERFROMHDC open = {0};
+-   open.hDc = hdc;
+-   NTSTATUS status = gpu->pfnOpenAdapterFromHdc(&open);
+-   ReleaseDC(NULL, hdc);
+-
+-   if (!NT_SUCCESS(status)) {
+-      vn_log(gpu->instance, "failed to open primary adapter");
+-      virtgpu_unload_d3dkmt(gpu);
+-      return VK_ERROR_INITIALIZATION_FAILED;
+-   }
+-
+-   D3DKMT_CREATEDEVICE create = {0};
+-   create.hAdapter = open.hAdapter;
+-   status = gpu->pfnCreateDevice(&create);
+-
+-   if (!NT_SUCCESS(status)) {
+-      vn_log(gpu->instance, "failed to create D3DKMT device");
+-      D3DKMT_CLOSEADAPTER close = {0};
+-      close.hAdapter = open.hAdapter;
+-      gpu->pfnCloseAdapter(&close);
+-      virtgpu_unload_d3dkmt(gpu);
+-      return VK_ERROR_INITIALIZATION_FAILED;
+-   }
+-
+    VIOGPU_ADAPTERINFO info;
+    memset(&info, 0, sizeof(info));
+    D3DKMT_QUERYADAPTERINFO query = {0};
+-   query.hAdapter = open.hAdapter;
++   query.hAdapter = hAdapter;
+    query.Type = KMTQAITYPE_UMDRIVERPRIVATE;
+    query.pPrivateDriverData = &info;
+    query.PrivateDriverDataSize = sizeof(info);
+-   status = gpu->pfnQueryAdapterInfo(&query);
++   NTSTATUS status = gpu->pfnQueryAdapterInfo(&query);
++   if (!NT_SUCCESS(status) || info.IamVioGPU != VIOGPU_IAM)
++      return false;
+ 
+-   if (!NT_SUCCESS(status) || info.IamVioGPU != VIOGPU_IAM) {
+-      vn_log(gpu->instance, "primary adapter is not virtio-win viogpu");
+-      D3DKMT_DESTROYDEVICE destroy = {0};
+-      destroy.hDevice = create.hDevice;
+-      gpu->pfnDestroyDevice(&destroy);
+-      D3DKMT_CLOSEADAPTER close = {0};
+-      close.hAdapter = open.hAdapter;
+-      gpu->pfnCloseAdapter(&close);
+-      virtgpu_unload_d3dkmt(gpu);
+-      return VK_ERROR_INITIALIZATION_FAILED;
++   D3DKMT_CREATEDEVICE create = {0};
++   create.hAdapter = hAdapter;
++   status = gpu->pfnCreateDevice(&create);
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "failed to create D3DKMT device (status=0x%lx)",
++             (unsigned long)status);
++      return false;
+    }
+ 
+-   gpu->hAdapter = open.hAdapter;
+-   gpu->adapter_luid = open.AdapterLuid;
++   gpu->hAdapter = hAdapter;
++   gpu->adapter_luid = adapter_luid;
+    gpu->hDevice = create.hDevice;
+    gpu->adapter_info = info;
+    gpu->has_primary = true;
+@@ -2165,10 +2138,112 @@ virtgpu_open(struct virtgpu *gpu)
+    gpu->primary_minor = 0;
+    gpu->render_major = 0;
+    gpu->render_minor = 0;
+-   if (VN_DEBUG(INIT))
+-      vn_log(gpu->instance, "using primary virtio-win adapter");
++   return true;
++}
+ 
+-   return VK_SUCCESS;
++static bool
++virtgpu_open_enumerated_adapter(struct virtgpu *gpu)
++{
++   if (gpu->pfnEnumAdapters2) {
++      D3DKMT_ENUMADAPTERS2 enum2 = {0};
++      NTSTATUS status = gpu->pfnEnumAdapters2(&enum2);
++      if (NT_SUCCESS(status) && enum2.NumAdapters > 0) {
++         D3DKMT_ADAPTERINFO *adapters =
++            calloc(enum2.NumAdapters, sizeof(*adapters));
++         if (adapters) {
++            enum2.pAdapters = adapters;
++            status = gpu->pfnEnumAdapters2(&enum2);
++            if (NT_SUCCESS(status)) {
++               bool found = false;
++               for (ULONG i = 0; i < enum2.NumAdapters; i++) {
++                  if (!found &&
++                      virtgpu_try_open_adapter(gpu, adapters[i].hAdapter,
++                                               adapters[i].AdapterLuid)) {
++                     found = true;
++                     continue;
++                  }
++                  if (adapters[i].hAdapter) {
++                     D3DKMT_CLOSEADAPTER close = {
++                        .hAdapter = adapters[i].hAdapter,
++                     };
++                     gpu->pfnCloseAdapter(&close);
++                  }
++               }
++               free(adapters);
++               if (found)
++                  return true;
++            } else {
++               free(adapters);
++            }
++         }
++      }
++   }
++
++   if (gpu->pfnEnumAdapters) {
++      D3DKMT_ENUMADAPTERS enum1 = {0};
++      NTSTATUS status = gpu->pfnEnumAdapters(&enum1);
++      if (NT_SUCCESS(status)) {
++         bool found = false;
++         ULONG count = enum1.NumAdapters < MAX_ENUM_ADAPTERS ?
++                          enum1.NumAdapters : MAX_ENUM_ADAPTERS;
++         for (ULONG i = 0; i < count; i++) {
++            if (!found &&
++                virtgpu_try_open_adapter(gpu, enum1.Adapters[i].hAdapter,
++                                         enum1.Adapters[i].AdapterLuid)) {
++               found = true;
++               continue;
++            }
++            if (enum1.Adapters[i].hAdapter) {
++               D3DKMT_CLOSEADAPTER close = {
++                  .hAdapter = enum1.Adapters[i].hAdapter,
++               };
++               gpu->pfnCloseAdapter(&close);
++            }
++         }
++         if (found)
++            return true;
++      }
++   }
++
++   return false;
++}
++
++static VkResult
++virtgpu_open(struct virtgpu *gpu)
++{
++   if (!virtgpu_load_d3dkmt(gpu)) {
++      vn_log(gpu->instance, "failed to load D3DKMT entrypoints");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   HDC hdc = GetDC(NULL);
++   if (hdc) {
++      D3DKMT_OPENADAPTERFROMHDC open = {0};
++      open.hDc = hdc;
++      NTSTATUS status = gpu->pfnOpenAdapterFromHdc(&open);
++      ReleaseDC(NULL, hdc);
++
++      if (NT_SUCCESS(status)) {
++         if (virtgpu_try_open_adapter(gpu, open.hAdapter, open.AdapterLuid)) {
++            if (VN_DEBUG(INIT))
++               vn_log(gpu->instance, "using primary virtio-win adapter");
++            return VK_SUCCESS;
++         }
++         D3DKMT_CLOSEADAPTER close = {0};
++         close.hAdapter = open.hAdapter;
++         gpu->pfnCloseAdapter(&close);
++      }
++   }
++
++   if (virtgpu_open_enumerated_adapter(gpu)) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "using enumerated virtio-win adapter");
++      return VK_SUCCESS;
++   }
++
++   vn_log(gpu->instance, "failed to open virtio-win viogpu adapter");
++   virtgpu_unload_d3dkmt(gpu);
++   return VK_ERROR_INITIALIZATION_FAILED;
+ }
+ 
+ static VkResult
+diff --git a/src/vulkan/util/vk_dispatch_table_gen.py b/src/vulkan/util/vk_dispatch_table_gen.py
+index c2776d2..3729a95 100644
+--- a/src/vulkan/util/vk_dispatch_table_gen.py
++++ b/src/vulkan/util/vk_dispatch_table_gen.py
+@@ -65,7 +65,7 @@ TEMPLATE_H = Template(COPYRIGHT + """\
+ extern "C" {
+ #endif
+ 
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void);
+ #endif
+ 
+@@ -567,7 +567,7 @@ vk_device_entrypoint_is_enabled(int index, uint32_t core_version,
+    }
+ }
+ 
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void)
+ {
+    UNREACHABLE("Entrypoint not implemented");
+@@ -576,7 +576,7 @@ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void)
+ static const void *get_function_target(const void *func)
+ {
+    const uint8_t *address = func;
+-#ifdef _M_X64
++#if defined(_M_X64) && !defined(__arm64ec__) && !defined(_M_ARM64EC)
+    /* Incremental linking may indirect through relative jump */
+    if (*address == 0xE9)
+    {
+@@ -609,7 +609,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     if (overwrite) {
+         memset(dispatch_table, 0, sizeof(*dispatch_table));
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+             assert(entry[i] != NULL);
+             if (vk_function_is_stub(entry[i]))
+ #else
+@@ -623,7 +623,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     } else {
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+             unsigned disp_index = ${type}_compaction_table[i];
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+             assert(entry[i] != NULL);
+             if (disp[disp_index] == NULL && !vk_function_is_stub(entry[i]))
+ #else
+diff --git a/src/vulkan/util/vk_entrypoints_gen.py b/src/vulkan/util/vk_entrypoints_gen.py
+index 9dbe00e..de2b0c7 100644
+--- a/src/vulkan/util/vk_entrypoints_gen.py
++++ b/src/vulkan/util/vk_entrypoints_gen.py
+@@ -59,7 +59,7 @@ extern "C" {
+  * On MSVC, weak symbols are not well supported, so we use the functionally
+  * equivalent /alternatename.
+  */
+-#if !defined(_MSC_VER) && defined(VK_ENTRY_USE_WEAK)
++#if !defined(_MSC_VER) && !defined(__arm64ec__) && !defined(_M_ARM64EC) && defined(VK_ENTRY_USE_WEAK)
+ #define VK_ENTRY_WEAK __attribute__ ((weak))
+ #else
+ #define VK_ENTRY_WEAK
+@@ -185,6 +185,11 @@ TEMPLATE_C = Template(COPYRIGHT + """
+     #pragma comment(linker, "/alternatename:#${p}_${e.name}=#vk_entrypoint_stub")
+ #endif
+ #endif
++#elif defined(__arm64ec__) || defined(_M_ARM64EC)
++    __asm__(".section .drectve,\\"yn\\"\\n"
++            ".ascii \\" /alternatename:${p}_${e.name}=vk_entrypoint_stub\\"\\n"
++            ".ascii \\" /alternatename:#${p}_${e.name}=#vk_entrypoint_stub\\"\\n"
++            ".text\\n");
+ #else
+     % if entrypoints == device_entrypoints:
+       % for v in tmpl_variants:
+@@ -209,7 +214,7 @@ const struct vk_${type}_entrypoint_table ${p}_${type}_entrypoints = {
+     % endif
+     .${e.name} = ${p}_${e.name},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif
+@@ -226,7 +231,7 @@ const struct vk_${type}_entrypoint_table ${tmpl_prefix}_${type}_entrypoints_${en
+     % endif
+     .${e.name} = ${tmpl_prefix}_${e.name}${v},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) || defined(__arm64ec__) || defined(_M_ARM64EC)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif

@@ -1,0 +1,237 @@
+diff --git a/bvm b/bvm
+index 017a760..3cc569b 100755
+--- a/bvm
++++ b/bvm
+@@ -174,10 +174,27 @@ connect_qcow2_to_nbd() { #find unused /dev/nbd* device to use, register it with
+   echo "$nbd_device"
+ }
+ 
++unmount_nbd_partitions() { #unmount any partitions on an nbd device (such as desktop udisks automounts)
++  local nbd_device="$1"
++  local part mp
++  sudo udevadm settle 2>/dev/null || sleep 1
++  sleep 1
++  for part in "${nbd_device}"p*; do
++    [ -b "$part" ] || continue
++    while IFS= read -r mp; do
++      [ -n "$mp" ] && umount_retry "$mp"
++    done < <(findmnt -rn -o TARGET --source "$part" 2>/dev/null)
++  done
++}
++
+ mount_qcow2() { #mount the $1 qcow2 disk image to /media/$USER/bvm-mount$rdp_port folder (rdp_port is just a convenient way to prevent conflict
+   
+   #find /dev/nbd* device not in use
+-  local nbd_device="$(connect_qcow2_to_nbd "$1")" || exit 1
++  local nbd_device
++  nbd_device="$(connect_qcow2_to_nbd "$1")" || exit 1
++  
++  #clear any desktop automounts (e.g. udisks2) before running ntfsfix/mount
++  unmount_nbd_partitions "$nbd_device"
+   
+   #try to fix the filesystem so it can be mounted R/W even after unsafe shutdown
+   if sudo ntfsfix --clear-dirty ${nbd_device}p4 ;then
+@@ -190,7 +207,8 @@ mount_qcow2() { #mount the $1 qcow2 disk image to /media/$USER/bvm-mount$rdp_por
+   umount_retry /media/$USER/bvm-mount$rdp_port
+   if ! sudo mount -t ntfs-3g "${mount_args[@]}" ${nbd_device}p4 /media/$USER/bvm-mount$rdp_port ;then
+     #mount failed, unmount and cleanup
+-    unmount_qcow2
++    unmount_nbd_partitions "$nbd_device"
++    sudo qemu-nbd --disconnect "$nbd_device" &>/dev/null
+     error "mount_qcow2: mount command failed"
+   fi
+ }
+@@ -201,13 +219,14 @@ unmount_qcow2() { #unmount what was mounted by the mount_qcow2 function
+   [ "$nbd_device" == /dev/ ] && return 1
+   
+   umount_retry /media/$USER/bvm-mount$rdp_port
++  unmount_nbd_partitions "$nbd_device"
+   
+   #try to remove the nbd device only if we found it earlier
+   if [ ! -z "$nbd_device" ];then
+     local errors
+     errors="$(sudo qemu-nbd --disconnect "$nbd_device" 2>&1)" || error "unmount_qcow2: '$errors'"
+   fi
+-  sudo rmdir /media/$USER/bvm-mount$rdp_port
++  sudo rmdir /media/$USER/bvm-mount$rdp_port 2>/dev/null || true
+ }
+ 
+ remove_microsoft_defender() { #given mountpoint on $1, remove microsoft defender files from image
+@@ -250,7 +269,7 @@ remove_UCPD_from_mountpoint() { #force the specified windows installation to rem
+   #location of UCPD.sys: Windows/System32/drivers/UCPD.sys
+   
+   local mountpoint="$1"
+-  if [ -e "$mountpoint/Windows/System32/drivers/UCPD.sys" ];then
++  if [ -e "$mountpoint/Windows/System32/drivers/UCPD.sys" ] || [ -L "$mountpoint/Windows/System32/drivers/UCPD.sys" ];then
+     if sudo rm -f "$mountpoint/Windows/System32/drivers/UCPD.sys" ;then
+       status_green "Successfully removed UCPD.sys from disk.qcow2"
+     fi
+@@ -615,7 +634,7 @@ package_available() { #determine if the specified package-name exists in a local
+ 
+ install_dependencies() { #try to install everything BVM needs
+   required_commands="git jq wget mkisofs qemu-img qemu-system-aarch64 remmina nmap wget yad uuidgen wiminfo socat ntfsresize nc bc"
+-  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional bc"
++  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional bc virgl-server"
+   
+   #using freerdp version 2 instead of 3 because it does not freeze on login and has more reliable clipboard sync
+   if [ "$XDG_SESSION_TYPE" == wayland ];then
+@@ -658,6 +677,9 @@ install_dependencies() { #try to install everything BVM needs
+   elif [ ! -f /usr/lib/ipxe/qemu/pxe-virtio.rom ];then
+     #ipxe-qemu is missing
+     installneeded=1
++  elif [ ! -x /usr/libexec/virgl_render_server ];then
++    #virgl-server is required for Venus 3D acceleration
++    installneeded=1
+   fi
+   
+   #hide the changelog
+@@ -978,7 +1000,7 @@ case "$mode" in
+     echo -e "BVM HELP:   --------------------------------------------------------------------
+ \e[96mAll primary modes: new-vm, download, prepare, firstboot, boot, connect, mount, expand\e[0m
+ You generally want to run the modes in that order.
+-Additional modes: help, list-languages, boot-nodisplay, boot-ramfb, boot-gtk, connect-freerdp, connect-remmina
++Additional modes: help, list-languages, boot-nodisplay, boot-ramfb, boot-gtk, boot-3d, connect-freerdp, connect-remmina
+ 
+ To get a fresh VM up and running, use a sequence like this:
+ \e[96m$0 new-vm $HOME/win11\e[0m
+@@ -1428,7 +1450,8 @@ To get a fresh VM up and running, use a sequence like this:
+     
+     #workaround for users who experienced microsoft defender removal failure on firstboot (https://github.com/Botspot/bvm/issues/19)
+     if [ "$(cat "$vmdir/gui-steps-complete")" == 4 ];then #this will be 4 because firstboot failed after succeeding
+-      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "/media/$USER/bvm-mount$rdp_port" && remove_UCPD_from_mountpoint "$mountpoint" && echo 5 > "$vmdir/gui-steps-complete")
++      mountpoint="/media/$USER/bvm-mount$rdp_port"
++      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "$mountpoint" && remove_UCPD_from_mountpoint "$mountpoint" && echo 5 > "$vmdir/gui-steps-complete")
+       unmount_qcow2
+     fi
+     
+@@ -1441,7 +1464,10 @@ To get a fresh VM up and running, use a sequence like this:
+       error "BVM needs a desktop environment to run $mode"
+     fi
+     
+-    #choose display mode (ramfb, gtk, none)
++    #choose display mode (ramfb, gtk, 3d, none)
++    machine_flags=(-M virt,accel=kvm)
++    memory_backend_flags=()
++    balloon_flags=(-device virtio-balloon)
+     case "$mode" in
+       boot-nodisplay)
+         display_flags=(-vga none -device virtio-gpu-pci -display none)
+@@ -1452,6 +1478,13 @@ To get a fresh VM up and running, use a sequence like this:
+       boot-gtk|boot)
+         display_flags=(-vga none -device virtio-gpu-pci -display gtk,gl=off,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
+         ;;
++      boot-3d)
++        #Venus 3D acceleration requires shared memfd guest RAM and no dynamic balloon shrinking
++        machine_flags=(-M virt,accel=kvm,memory-backend=mem1)
++        memory_backend_flags=(-object "memory-backend-memfd,id=mem1,size=${vm_mem}G,share=on")
++        balloon_flags=()
++        display_flags=(-vga none -device "virtio-gpu-gl-pci,hostmem=${virtio_hostmem:-2G},blob=on,venus=on" -display "gtk,gl=on,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on')")
++        ;;
+       *)
+         error "Unknown suffix after 'boot': '$mode'"
+         ;;
+@@ -1463,17 +1496,17 @@ To get a fresh VM up and running, use a sequence like this:
+     fi
+     
+     #determine audio backend to use, try to de-crackle it as much as possible
+-    if pgrep pipewire >/dev/null && qemu_newer_than 8.1.0 ;then
+-      #Make QEMU use pipewire output backend, if possible
+-      debug "Using pipewire audio backend"
+-      audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pipewire,id=my_audiodev,out.buffer-length=1000000,out.mixing-engine=off,out.fixed-settings=off")
+-      #if QEMU does not support pipewire, fallback to pulseaudio if pipewire's pulseaudio bridge is running
+-    elif pgrep pulseaudio >/dev/null || pgrep pipewire-pulse >/dev/null ;then
++    #Prefer PulseAudio/pipewire-pulse in boot-3d (QEMU audio-pipewire can deadlock BQL on pw_thread_loop_lock)
++    if pgrep pulseaudio >/dev/null || pgrep pipewire-pulse >/dev/null ;then
+       #Make QEMU use pulseaudio output backend
+       debug "Using pulseaudio audio backend"
+       audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pa,id=my_audiodev,out.buffer-length=1000000")
++    elif pgrep pipewire >/dev/null && qemu_newer_than 8.1.0 ;then
++      #Make QEMU use pipewire output backend, if possible
++      debug "Using pipewire audio backend"
++      audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pipewire,id=my_audiodev,out.buffer-length=1000000,out.mixing-engine=off,out.fixed-settings=off")
+     else
+-      #Make QEMU use pulseaudio output backend (fallback)
++      #Make QEMU use alsa output backend (fallback)
+       debug "Using alsa audio backend"
+       audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "alsa,id=my_audiodev,out.buffer-length=1000000")
+     fi
+@@ -1519,10 +1552,11 @@ To get a fresh VM up and running, use a sequence like this:
+     #network_flags=(-netdev user,id=nic,hostfwd=tcp:127.0.0.1:${rdp_port}-:3389 -device virtio-net-pci,netdev=nic)
+     rm -f "$vmdir/qemu.pid"
+     #all QEMU flags are combined together here
+-    full_qemu_flags=(-M virt,accel=kvm -cpu host -m ${vm_mem}G -smp $num_cores \
++    full_qemu_flags=("${machine_flags[@]}" -cpu host -m ${vm_mem}G -smp $num_cores \
++      "${memory_backend_flags[@]}" \
+       -name BVM,process=bvm \
+       -pidfile "$vmdir/qemu.pid" \
+-      -device virtio-balloon \
++      "${balloon_flags[@]}" \
+       -device virtio-serial-pci \
+       "${display_flags[@]}" \
+       -device qemu-xhci \
+@@ -1536,32 +1570,35 @@ To get a fresh VM up and running, use a sequence like this:
+       -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+       -drive file="$vmdir/disk.qcow2",if=virtio,discard=unmap,aio=threads,cache=none \
+       -device qemu-xhci,id=passthrough_xhci,p2=8,p3=8 \
+-      "${usb_forwarding_flags[@]}")
++      "${usb_forwarding_flags[@]}" \
++      "${extra_qemu_flags[@]}")
+     
+     debug "full_qemu_flags: " "${full_qemu_flags[@]}"
+     
+-    #always try to pick optimal VM RAM limit by sending repeated balloon requests
+-    total_ram=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
+-    
+-    #try to keep free_ram_goal MB free RAM on Linux at all times by setting the balloon size of the VM
+-    #Windows will eat as much RAM as possible for caches, so it can be reallocated as needed.
+-    #This "balloon_popper" process is what's needed to make the virtio-balloon driver actually do something.
+-    while true;do
+-      sleep 1
+-      qemu_pid="$(cat "$vmdir/qemu.pid" 2>/dev/null)"
+-      [ -z "$qemu_pid" ] && continue
++    if [ ${#balloon_flags[@]} -gt 0 ];then
++      #always try to pick optimal VM RAM limit by sending repeated balloon requests
++      total_ram=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
+       
+-      free_ram=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
+-      qemu_used_ram=$(grep VmRSS /proc/$qemu_pid/status | awk '{print $2/1024}' | sed 's/[.,].*//g')
+-      other_tasks_ram=$((total_ram - (qemu_used_ram + free_ram)))
+-      #echo "other taks use $other_tasks_ram"
+-      balloon_size=$((total_ram - other_tasks_ram - free_ram_goal))
+-      #echo "qemu using $qemu_used_ram, free $free_ram, balloon_size: $balloon_size"
+-      
+-      echo "balloon $balloon_size" | socat - UNIX-CONNECT:"$vmdir/qemu.sock" &>/dev/null
+-    done &
+-    balloon_popper=$!
+-    trap "kill $balloon_popper 2>/dev/null" EXIT SIGINT
++      #try to keep free_ram_goal MB free RAM on Linux at all times by setting the balloon size of the VM
++      #Windows will eat as much RAM as possible for caches, so it can be reallocated as needed.
++      #This "balloon_popper" process is what's needed to make the virtio-balloon driver actually do something.
++      while true;do
++        sleep 1
++        qemu_pid="$(cat "$vmdir/qemu.pid" 2>/dev/null)"
++        [ -z "$qemu_pid" ] && continue
++        
++        free_ram=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
++        qemu_used_ram=$(grep VmRSS /proc/$qemu_pid/status | awk '{print $2/1024}' | sed 's/[.,].*//g')
++        other_tasks_ram=$((total_ram - (qemu_used_ram + free_ram)))
++        #echo "other taks use $other_tasks_ram"
++        balloon_size=$((total_ram - other_tasks_ram - free_ram_goal))
++        #echo "qemu using $qemu_used_ram, free $free_ram, balloon_size: $balloon_size"
++        
++        echo "balloon $balloon_size" | socat - UNIX-CONNECT:"$vmdir/qemu.sock" &>/dev/null
++      done &
++      balloon_popper=$!
++      trap "kill $balloon_popper 2>/dev/null" EXIT SIGINT
++    fi
+     
+     retrying=0
+     time_before="$(sed 's/\..*//g' /proc/uptime)"
+@@ -1611,7 +1648,7 @@ To get a fresh VM up and running, use a sequence like this:
+       fi
+     done
+     
+-    kill $balloon_popper
++    [ -n "$balloon_popper" ] && kill $balloon_popper 2>/dev/null
+     sudo rm -f "$udev_file"
+     ;;
